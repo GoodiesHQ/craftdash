@@ -1,2 +1,2 @@
 # craftdash
-A dashboard for using all craft applications behind a single Traefik endpoint.
+A dashboard for using all craft applications behind a single endpoint.
