@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Craft</title>
+    <title>ArtCraft</title>
     <style>
       :root {
         --bg: #f4f2ee;
@@ -28,21 +28,13 @@
           --ring: #ece8e1;
         }
       }
-      * {
-        box-sizing: border-box;
-      }
+      * { box-sizing: border-box; }
       body {
         margin: 0;
         min-height: 100vh;
         background: var(--bg);
         color: var(--text);
-        font:
-          15px/1.45 ui-sans-serif,
-          system-ui,
-          -apple-system,
-          "Segoe UI",
-          Roboto,
-          sans-serif;
+        font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       }
       main {
         max-width: 960px;
@@ -62,10 +54,7 @@
         font-weight: 650;
         letter-spacing: -0.02em;
       }
-      #count {
-        color: var(--muted);
-        font-size: 13px;
-      }
+      #count { color: var(--muted); font-size: 13px; }
       ul {
         list-style: none;
         margin: 0;
@@ -85,18 +74,10 @@
         color: inherit;
         background: var(--surface);
         border: 1px solid var(--line);
-        transition:
-          transform 0.12s ease,
-          border-color 0.12s ease;
+        transition: transform 0.12s ease, border-color 0.12s ease;
       }
-      a.app:hover {
-        transform: translateY(-2px);
-        border-color: var(--muted);
-      }
-      a.app:focus-visible {
-        outline: 2px solid var(--ring);
-        outline-offset: 2px;
-      }
+      a.app:hover { transform: translateY(-2px); border-color: var(--muted); }
+      a.app:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
       .tile {
         width: 44px;
         height: 44px;
@@ -109,27 +90,10 @@
         background: hsl(var(--hue) 55% 45%);
         overflow: hidden;
       }
-      .tile.icon {
-        background: none;
-      }
-      .tile img {
-        width: 100%;
-        height: 100%;
-        object-fit: contain;
-        display: block;
-      }
-      .name {
-        font-weight: 600;
-        font-size: 16px;
-      }
-      .path {
-        color: var(--muted);
-        font:
-          12.5px ui-monospace,
-          SFMono-Regular,
-          Menlo,
-          monospace;
-      }
+      .tile.icon { background: none; }
+      .tile img { width: 100%; height: 100%; object-fit: contain; display: block; }
+      .name { font-weight: 600; font-size: 16px; }
+      .path { color: var(--muted); font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
       .meta {
         margin-top: auto;
         display: flex;
@@ -138,50 +102,40 @@
         font-size: 12.5px;
         color: var(--muted);
       }
-      .dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        background: var(--line);
-        flex: none;
-      }
-      .up .dot {
-        background: var(--ok);
-      }
-      .down .dot {
-        background: var(--down);
-      }
-      .down .tile {
-        filter: grayscale(1);
-        opacity: 0.6;
-      }
-      .empty {
-        color: var(--muted);
-        padding: 40px 0;
-      }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line); flex: none; }
+      .up .dot { background: var(--ok); }
+      .down .dot { background: var(--down); }
+      .down .tile { filter: grayscale(1); opacity: 0.6; }
+      .empty { color: var(--muted); padding: 40px 0; }
     </style>
   </head>
   <body>
     <main>
       <header>
-        <h1 id="title">Craft</h1>
+        <h1 id="title">ArtCraft</h1>
         <span id="count"></span>
       </header>
       <ul id="apps"></ul>
     </main>
     <script>
       (async () => {
+        const REFRESH_INTERVAL = 10_000;
+        const REQUEST_TIMEOUT = 8_000;
         const list = document.getElementById("apps");
+        const cards = [];
+        let refreshing = false;
+
         const getJSON = (url, fallback) =>
           fetch(url, { cache: "no-store" })
-            .then((r) => (r.ok ? r.json() : fallback))
+            .then((response) => (response.ok ? response.json() : fallback))
             .catch(() => fallback);
+
         const [cfg, icons] = await Promise.all([
-          getJSON("/apps.json", { title: "Craft", apps: [] }),
-          getJSON("/icons/index.json", {}), // { "<app name>": "<file>" }, built into the image
+          getJSON("/apps.json", { title: "ArtCraft", apps: [] }),
+          getJSON("/icons/index.json", {}),
         ]);
 
-        const title = cfg.title || "Craft";
+        const title = cfg.title || "ArtCraft";
         document.title = title;
         document.getElementById("title").textContent = title;
 
@@ -190,41 +144,41 @@
           apps.length === 1 ? "1 app" : `${apps.length} apps`;
 
         if (!apps.length) {
-          const li = document.createElement("li");
-          li.className = "empty";
-          li.textContent = "No apps are enabled in this environment.";
-          list.append(li);
+          const item = document.createElement("li");
+          item.className = "empty";
+          item.textContent = "No apps are enabled in this environment.";
+          list.append(item);
           return;
         }
 
-        const hue = (s) =>
-          [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
+        const hue = (text) =>
+          [...text].reduce((value, character) => (value * 31 + character.charCodeAt(0)) % 360, 7);
 
         for (const app of apps) {
           const href = `/${app.slug}/`;
-          const a = document.createElement("a");
-          a.className = "app";
-          a.href = href;
-          a.style.setProperty("--hue", hue(app.slug));
+          const link = document.createElement("a");
+          link.className = "app";
+          link.href = href;
+          link.style.setProperty("--hue", hue(app.slug));
 
           const tile = document.createElement("span");
           tile.className = "tile";
-          const letters = () => {
+          const showLetters = () => {
             tile.className = "tile";
             tile.textContent =
               (app.title || app.slug).replace(/craft$/i, "").slice(0, 2) || "?";
           };
           const iconFile = icons[app.name];
           if (iconFile) {
-            const img = document.createElement("img");
-            img.src = `/icons/${encodeURIComponent(iconFile)}`;
-            img.alt = "";
-            img.decoding = "async";
-            img.onerror = letters;
+            const image = document.createElement("img");
+            image.src = `/icons/${encodeURIComponent(iconFile)}`;
+            image.alt = "";
+            image.decoding = "async";
+            image.onerror = showLetters;
             tile.className = "tile icon";
-            tile.append(img);
+            tile.append(image);
           } else {
-            letters();
+            showLetters();
           }
 
           const text = document.createElement("span");
@@ -244,22 +198,51 @@
           status.textContent = "checking…";
           meta.append(dot, status);
 
-          a.append(tile, text, meta);
-          const li = document.createElement("li");
-          li.append(a);
-          list.append(li);
-
-          fetch(`${href}_craft/version`, { cache: "no-store" })
-            .then((r) => (r.ok ? r.json() : Promise.reject()))
-            .then((v) => {
-              a.classList.add("up");
-              status.textContent = v.version ? `v${v.version}` : "running";
-            })
-            .catch(() => {
-              a.classList.add("down");
-              status.textContent = "not running";
-            });
+          link.append(tile, text, meta);
+          const item = document.createElement("li");
+          item.append(link);
+          list.append(item);
+          cards.push({ href, link, status });
         }
+
+        async function checkStatus(card) {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+          try {
+            const response = await fetch(`${card.href}_craft/version`, {
+              cache: "no-store",
+              signal: controller.signal,
+            });
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}`);
+            }
+            const result = await response.json();
+            card.link.classList.remove("down");
+            card.link.classList.add("up");
+            card.status.textContent = result.version ? `v${result.version}` : "running";
+          } catch {
+            card.link.classList.remove("up");
+            card.link.classList.add("down");
+            card.status.textContent = "not running";
+          } finally {
+            clearTimeout(timeout);
+          }
+        }
+
+        async function refreshStatuses() {
+          if (refreshing) return;
+          refreshing = true;
+          try {
+            await Promise.all(cards.map(checkStatus));
+          } finally {
+            refreshing = false;
+          }
+        }
+
+        // Check immediately, then update the existing cards every 10 seconds.
+        refreshStatuses();
+        setInterval(refreshStatuses, REFRESH_INTERVAL);
       })();
     </script>
   </body>
