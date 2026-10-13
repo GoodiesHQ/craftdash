@@ -1,0 +1,37 @@
+{
+	admin off
+	persist_config off
+	auto_https off
+}
+
+:8080 {
+	root * /srv
+
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	# Read by the dashboard to show which version of this app is actually running
+	handle /_craft/version {
+		header Content-Type application/json
+		header Cache-Control no-store
+		respond `{"app":"{env.CRAFT_APP}","version":"{env.CRAFT_VERSION}"}` 200
+	}
+
+	header X-Content-Type-Options nosniff
+
+	# Hashed build artifacts never change, cache them forever
+	@immutable path *.wasm *.js
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+	# Entry point and font manifest must revalidate so new versions show up
+	@revalidate path / /index.html /fonts/manifest.txt
+	header @revalidate Cache-Control "no-cache"
+
+	handle {
+		# Serves the .br/.gz siblings built into the image when the client accepts them
+		file_server {
+			precompressed br gzip
+		}
+	}
+}
