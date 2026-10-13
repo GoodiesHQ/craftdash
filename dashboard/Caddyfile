@@ -1,0 +1,45 @@
+{
+	admin off
+	persist_config off
+	auto_https off
+}
+
+:8080 {
+	root * /srv
+	encode gzip
+
+	header X-Content-Type-Options nosniff
+	header Cache-Control no-cache
+
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	# The enabled apps for this environment, straight from the container's env vars
+	handle /apps.json {
+		header Content-Type application/json
+		header Cache-Control no-store
+		respond {env.CRAFT_CONFIG} 200
+	}
+
+	# Icons are baked into the image; the index revalidates so a rebuilt dashboard shows up at once.
+	handle /icons/index.json {
+		file_server
+	}
+
+	handle /icons/* {
+		header Cache-Control "public, max-age=86400"
+		file_server
+	}
+
+	# Any other path under an app prefix lands here only when that app isn't running.
+	@app path_regexp ^/[a-z0-9-]+/
+	handle @app {
+		respond "That app isn't running in this environment." 404
+	}
+
+	handle {
+		try_files {path} /index.html
+		file_server
+	}
+}

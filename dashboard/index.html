@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Craft</title>
+    <style>
+      :root {
+        --bg: #f4f2ee;
+        --surface: #ffffff;
+        --text: #1d1b18;
+        --muted: #6d675e;
+        --line: #e3dfd7;
+        --ok: #2f8a4c;
+        --down: #b4433a;
+        --ring: #1d1b18;
+        color-scheme: light dark;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #151413;
+          --surface: #1f1d1b;
+          --text: #ece8e1;
+          --muted: #9a938a;
+          --line: #2e2b28;
+          --ok: #5cc27e;
+          --down: #e0776d;
+          --ring: #ece8e1;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          15px/1.45 ui-sans-serif,
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          Roboto,
+          sans-serif;
+      }
+      main {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 56px 20px 40px;
+      }
+      header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 28px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 28px;
+        font-weight: 650;
+        letter-spacing: -0.02em;
+      }
+      #count {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      ul {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: grid;
+        gap: 14px;
+        grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+      }
+      a.app {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        height: 100%;
+        padding: 18px;
+        border-radius: 14px;
+        text-decoration: none;
+        color: inherit;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        transition:
+          transform 0.12s ease,
+          border-color 0.12s ease;
+      }
+      a.app:hover {
+        transform: translateY(-2px);
+        border-color: var(--muted);
+      }
+      a.app:focus-visible {
+        outline: 2px solid var(--ring);
+        outline-offset: 2px;
+      }
+      .tile {
+        width: 44px;
+        height: 44px;
+        border-radius: 11px;
+        display: grid;
+        place-items: center;
+        font-weight: 700;
+        font-size: 17px;
+        color: #fff;
+        background: hsl(var(--hue) 55% 45%);
+        overflow: hidden;
+      }
+      .tile.icon {
+        background: none;
+      }
+      .tile img {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        display: block;
+      }
+      .name {
+        font-weight: 600;
+        font-size: 16px;
+      }
+      .path {
+        color: var(--muted);
+        font:
+          12.5px ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          monospace;
+      }
+      .meta {
+        margin-top: auto;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12.5px;
+        color: var(--muted);
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--line);
+        flex: none;
+      }
+      .up .dot {
+        background: var(--ok);
+      }
+      .down .dot {
+        background: var(--down);
+      }
+      .down .tile {
+        filter: grayscale(1);
+        opacity: 0.6;
+      }
+      .empty {
+        color: var(--muted);
+        padding: 40px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1 id="title">Craft</h1>
+        <span id="count"></span>
+      </header>
+      <ul id="apps"></ul>
+    </main>
+    <script>
+      (async () => {
+        const list = document.getElementById("apps");
+        const getJSON = (url, fallback) =>
+          fetch(url, { cache: "no-store" })
+            .then((r) => (r.ok ? r.json() : fallback))
+            .catch(() => fallback);
+        const [cfg, icons] = await Promise.all([
+          getJSON("/apps.json", { title: "Craft", apps: [] }),
+          getJSON("/icons/index.json", {}), // { "<app name>": "<file>" }, built into the image
+        ]);
+
+        const title = cfg.title || "Craft";
+        document.title = title;
+        document.getElementById("title").textContent = title;
+
+        const apps = Array.isArray(cfg.apps) ? cfg.apps : [];
+        document.getElementById("count").textContent =
+          apps.length === 1 ? "1 app" : `${apps.length} apps`;
+
+        if (!apps.length) {
+          const li = document.createElement("li");
+          li.className = "empty";
+          li.textContent = "No apps are enabled in this environment.";
+          list.append(li);
+          return;
+        }
+
+        const hue = (s) =>
+          [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
+
+        for (const app of apps) {
+          const href = `/${app.slug}/`;
+          const a = document.createElement("a");
+          a.className = "app";
+          a.href = href;
+          a.style.setProperty("--hue", hue(app.slug));
+
+          const tile = document.createElement("span");
+          tile.className = "tile";
+          const letters = () => {
+            tile.className = "tile";
+            tile.textContent =
+              (app.title || app.slug).replace(/craft$/i, "").slice(0, 2) || "?";
+          };
+          const iconFile = icons[app.name];
+          if (iconFile) {
+            const img = document.createElement("img");
+            img.src = `/icons/${encodeURIComponent(iconFile)}`;
+            img.alt = "";
+            img.decoding = "async";
+            img.onerror = letters;
+            tile.className = "tile icon";
+            tile.append(img);
+          } else {
+            letters();
+          }
+
+          const text = document.createElement("span");
+          const name = document.createElement("div");
+          name.className = "name";
+          name.textContent = app.title || app.slug;
+          const path = document.createElement("div");
+          path.className = "path";
+          path.textContent = href;
+          text.append(name, path);
+
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          const dot = document.createElement("span");
+          dot.className = "dot";
+          const status = document.createElement("span");
+          status.textContent = "checking…";
+          meta.append(dot, status);
+
+          a.append(tile, text, meta);
+          const li = document.createElement("li");
+          li.append(a);
+          list.append(li);
+
+          fetch(`${href}_craft/version`, { cache: "no-store" })
+            .then((r) => (r.ok ? r.json() : Promise.reject()))
+            .then((v) => {
+              a.classList.add("up");
+              status.textContent = v.version ? `v${v.version}` : "running";
+            })
+            .catch(() => {
+              a.classList.add("down");
+              status.textContent = "not running";
+            });
+        }
+      })();
+    </script>
+  </body>
+</html>
