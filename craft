@@ -1,0 +1,713 @@
+#!/usr/bin/env bash
+# craft — build and publish Craft images, and generate deployment files.
+#
+# Usage:
+#   craft list                              catalog with each app's latest release
+#   craft build <app|all> [version] [opts]  build an app (version defaults to its latest release)
+#   craft update [--push] [--force]         build every app whose latest release isn't built yet
+#   craft dashboard [--push]                build the dashboard image
+#   craft pin <app|all> [version]           download a release and record its sha256 in checksums.conf
+#   craft compose <env.conf> [-o dir]       generate docker-compose.yml for an environment
+#                                           (environments/nas.conf -> environments/nas/docker-compose.yml)
+#
+# <app> is a name or slug from apps.conf (photocraft or photo).
+#
+# Build options:
+#   --push          push to $REGISTRY (uses docker buildx)
+#   --latest        also tag :latest (automatic when no version is given)
+#   --sha256 HASH   verify the release zip against this sha256 (overrides checksums.conf)
+#   --url URL       override the release asset URL
+#
+# Environment:
+#   REGISTRY        image prefix (default: goodieshq (dockerhub); must not be empty for --push)
+#   PLATFORMS       platforms for --push builds (default: linux/amd64)
+#   CADDY_VERSION   Caddy base image tag (default: 2.11)
+#   GITHUB_TOKEN    optional; looks up releases through the GitHub API instead of redirects
+#   ICON_URL        dashboard icon URL pattern ({name} = app name; default: getartcraft.com icons)
+#   REQUIRE_SHA256  set to 1 to refuse building any release that isn't pinned in checksums.conf
+#
+# Every build verifies the release zip against checksums.conf when that app+version is listed.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CATALOG="$ROOT/apps.conf"
+CHECKSUMS="$ROOT/checksums.conf"
+REQUIRE_SHA256="${REQUIRE_SHA256:-0}"
+DASHBOARD_VERSION="1.3.0"
+DEFAULT_ICON_URL='https://getartcraft.com/images/apps/{name}/icon.webp'
+CADDY_VERSION="${CADDY_VERSION:-2.11}"
+PLATFORMS="${PLATFORMS:-linux/amd64}"
+REGISTRY="${REGISTRY:-goodieshq}"
+REGISTRY="${REGISTRY%/}"
+
+die() {
+  # stderr output and exit
+  echo "[craft]: $*" >&2
+  exit 1
+}
+
+warn() {
+  # stderr output 
+  echo "[craft]: $*" >&2
+}
+
+usage() {
+  # The comment at the top of this file is also the help text.
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+  exit "${1:-1}"
+}
+
+need_files() {
+  local directory=$1 file
+  shift
+
+  for file in "$@"; do
+    if [[ ! -f "$ROOT/$directory/$file" ]]; then
+      die "missing '$ROOT/$directory/$file'
+Expected layout next to the craft script:
+    app/Dockerfile        app/Caddyfile
+    dashboard/Dockerfile  dashboard/Caddyfile  dashboard/index.html"
+    fi
+  done
+}
+
+# Read the catalog as: name slug title repository asset.
+catalog() {
+  awk '!/^[[:space:]]*(#|$)/ { print $1, $2, $3, $4, ($5 == "" ? "-" : $5) }' "$CATALOG"
+}
+
+# Load the selected app. Other functions use these APP_* variables.
+find_app() {
+  local target=$1 name slug title repository asset
+
+  while read -r name slug title repository asset; do
+    if [[ $target == "$name" || $target == "$slug" ]]; then
+      APP_NAME=$name
+      APP_SLUG=$slug
+      APP_TITLE=$title
+      APP_REPO=$repository
+      APP_ASSET=$asset
+      return 0
+    fi
+  done < <(catalog)
+
+  return 1
+}
+
+image_for() {
+  if [[ -n $REGISTRY ]]; then
+    echo "$REGISTRY/$1"
+  else
+    echo "$1"
+  fi
+}
+
+asset_url() {
+  local version=$1 asset=$APP_ASSET
+
+  if [[ $asset == "-" ]]; then
+    asset="{name}-web-{version}.zip"
+  fi
+  asset=${asset//\{name\}/$APP_NAME}
+  asset=${asset//\{version\}/$version}
+
+  if [[ $asset == *://* ]]; then
+    echo "$asset"
+  else
+    echo "https://github.com/$APP_REPO/releases/download/v$version/$asset"
+  fi
+}
+
+latest_version() {
+  local repository=$1 tag redirect
+
+  if [[ -n ${GITHUB_TOKEN:-} ]]; then
+    tag=$(curl -fsS \
+      -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/$repository/releases/latest" 2>/dev/null \
+      | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+      | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/') || return 1
+  else
+    # GitHub's redirect gives us the latest tag without using the API.
+    redirect=$(curl -fsS -o /dev/null -w '%{redirect_url}' \
+      "https://github.com/$repository/releases/latest" 2>/dev/null) || return 1
+    if [[ $redirect != */releases/tag/* ]]; then
+      return 1
+    fi
+    tag=${redirect##*/releases/tag/}
+  fi
+
+  [[ -n $tag ]] || return 1
+  echo "${tag#v}"
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  else
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  fi
+}
+
+pinned_sha() {
+  if [[ -f $CHECKSUMS ]]; then
+    awk -v name="$1" -v version="$2" '
+      !/^[[:space:]]*(#|$)/ && $1 == name && $2 == version {
+        print tolower($3)
+        exit
+      }
+    ' "$CHECKSUMS"
+  fi
+  return 0
+}
+
+valid_sha() {
+  [[ $1 =~ ^[0-9a-fA-F]{64}$ ]]
+}
+
+check_version() {
+  if [[ ! $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.-]+)?$ ]]; then
+    die "invalid version '$1'; use a release version such as 0.7.0"
+  fi
+}
+
+image_exists() {
+  local image=$1 push=$2
+
+  if (( push )); then
+    docker buildx imagetools inspect "$image" >/dev/null 2>&1
+  else
+    docker image inspect "$image" >/dev/null 2>&1
+  fi
+}
+
+run_build() {
+  local push=$1
+  shift
+
+  if (( push )); then
+    [[ -n $REGISTRY ]] || die "--push requires REGISTRY (for example, registry.lan:5000)"
+    docker buildx build --platform "$PLATFORMS" --push "$@"
+  else
+    docker build "$@"
+  fi
+}
+
+build_app() {
+  local version=$1 push=$2 latest=$3 checksum=$4 url=$5
+  local image
+  local -a args
+
+  need_files app Dockerfile Caddyfile
+  image=$(image_for "$APP_NAME")
+
+  if [[ -z $url ]]; then
+    url=$(asset_url "$version")
+  fi
+  if [[ -z $checksum ]]; then
+    checksum=$(pinned_sha "$APP_NAME" "$version")
+  fi
+
+  if [[ -n $checksum ]]; then
+    valid_sha "$checksum" || die "$APP_NAME $version: SHA256 must contain 64 hexadecimal characters"
+    checksum=${checksum,,}
+  elif [[ $REQUIRE_SHA256 == 1 ]]; then
+    die "$APP_NAME $version has no checksum; run: ./craft pin $APP_SLUG $version"
+  fi
+
+  args=(
+    --build-arg "APP=$APP_NAME"
+    --build-arg "VERSION=$version"
+    --build-arg "REPO=$APP_REPO"
+    --build-arg "CADDY_VERSION=$CADDY_VERSION"
+    --build-arg "ASSET_URL=$url"
+    -t "$image:$version"
+  )
+  if (( latest )); then
+    args+=(-t "$image:latest")
+  fi
+  if [[ -n $checksum ]]; then
+    args+=(--build-arg "SHA256=$checksum")
+  fi
+
+  echo "Building $APP_NAME $version as $image:$version"
+  if (( latest )); then
+    echo "Also tagging $image:latest"
+  fi
+  if [[ -n $checksum ]]; then
+    echo "Release checksum: $checksum"
+  else
+    warn "$APP_NAME $version has no pinned checksum; the release zip will not be verified"
+  fi
+
+  run_build "$push" "${args[@]}" "$ROOT/app"
+}
+
+cmd_list() {
+  local name slug title repository asset version
+
+  printf '%-14s %-8s %-26s %s\n' NAME SLUG REPO LATEST
+  while read -r name slug title repository asset <&3; do
+    version=$(latest_version "$repository") || version="-"
+    printf '%-14s %-8s %-26s %s\n' "$name" "$slug" "$repository" "$version"
+  done 3< <(catalog)
+}
+
+cmd_build() {
+  [[ $# -ge 1 ]] || usage
+  local target=$1 version="" push=0 latest=0 checksum="" url=""
+  shift
+
+  if [[ $# -gt 0 && $1 != --* ]]; then
+    version=${1#v}
+    shift
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --push) push=1 ;;
+      --latest) latest=1 ;;
+      --sha256)
+        [[ $# -ge 2 && -n $2 ]] || die "--sha256 requires a value"
+        checksum=$2
+        shift
+        ;;
+      --url)
+        [[ $# -ge 2 && -n $2 ]] || die "--url requires a value"
+        url=$2
+        shift
+        ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  if [[ $target == all ]]; then
+    if [[ -n $version || -n $checksum || -n $url ]]; then
+      die "'build all' does not accept a version, --sha256 or --url"
+    fi
+    local name rest failed=0
+    local -a options=()
+    if (( push )); then
+      options+=(--push)
+    fi
+    # Docker may read stdin; keep the catalog on a separate descriptor.
+    while read -r name rest <&3; do
+      if ! (cmd_build "$name" "${options[@]}"); then
+        failed=$((failed + 1))
+      fi
+    done 3< <(catalog)
+    (( failed == 0 )) || die "$failed app(s) failed to build"
+    return 0
+  fi
+
+  find_app "$target" || die "unknown app '$target'; see apps.conf"
+  if [[ -z $version ]]; then
+    version=$(latest_version "$APP_REPO") || die "could not find a release for $APP_REPO"
+    latest=1
+  fi
+  check_version "$version"
+  build_app "$version" "$push" "$latest" "$checksum" "$url"
+}
+
+cmd_update() {
+  local push=0 force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --push) push=1 ;;
+      --force) force=1 ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  need_files app Dockerfile Caddyfile
+  local name rest version image built=0 current=0 skipped=0 failed=0
+  while read -r name rest <&3; do
+    find_app "$name"
+    if ! version=$(latest_version "$APP_REPO"); then
+      warn "$name: no release found for $APP_REPO; skipping"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    image="$(image_for "$name"):$version"
+    if (( !force )) && image_exists "$image" "$push"; then
+      echo "$name $version is already built"
+      current=$((current + 1))
+      continue
+    fi
+    if [[ $REQUIRE_SHA256 == 1 && -z $(pinned_sha "$name" "$version") ]]; then
+      warn "$name $version has no pinned checksum; review it, then run: ./craft pin $APP_SLUG $version"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    if (build_app "$version" "$push" 1 "" ""); then
+      built=$((built + 1))
+    else
+      warn "$name $version failed to build"
+      failed=$((failed + 1))
+    fi
+  done 3< <(catalog)
+
+  echo "Built: $built | Up to date: $current | Skipped: $skipped | Failed: $failed"
+  (( failed == 0 ))
+}
+
+cmd_dashboard() {
+  local push=0 image names
+  if [[ ${1:-} == --push ]]; then
+    push=1
+  fi
+
+  need_files dashboard Dockerfile Caddyfile index.html
+  image=$(image_for craft-dashboard)
+  names=$(catalog | awk '{ printf "%s%s", separator, $1; separator = " " }')
+
+  echo "Building craft-dashboard $DASHBOARD_VERSION as $image:$DASHBOARD_VERSION and :latest"
+  run_build "$push" \
+    --build-arg "CADDY_VERSION=$CADDY_VERSION" \
+    --build-arg "DASHBOARD_VERSION=$DASHBOARD_VERSION" \
+    --build-arg "ICONS=$names" \
+    --build-arg "ICON_URL=${ICON_URL:-$DEFAULT_ICON_URL}" \
+    -t "$image:$DASHBOARD_VERSION" -t "$image:latest" \
+    "$ROOT/dashboard"
+}
+
+cmd_pin() {
+  [[ $# -ge 1 ]] || usage
+  local target=$1 version=${2:-}
+  version=${version#v}
+
+  if [[ $target == all ]]; then
+    [[ -z $version ]] || die "'pin all' pins the latest releases and does not accept a version"
+    local name rest failed=0
+    while read -r name rest <&3; do
+      if ! (cmd_pin "$name"); then
+        failed=$((failed + 1))
+      fi
+    done 3< <(catalog)
+    (( failed == 0 )) || die "$failed app(s) could not be pinned"
+    return 0
+  fi
+
+  find_app "$target" || die "unknown app '$target'; see apps.conf"
+  if [[ -z $version ]]; then
+    version=$(latest_version "$APP_REPO") || die "could not find a release for $APP_REPO"
+  fi
+  check_version "$version"
+
+  local url temporary_file checksum old_checksum
+  url=$(asset_url "$version")
+  temporary_file=$(mktemp)
+  echo "Downloading $APP_NAME $version from $url"
+  if ! curl -fsSL --retry 3 -o "$temporary_file" "$url"; then
+    rm -f "$temporary_file"
+    die "download failed: $url"
+  fi
+  if ! checksum=$(sha256_of "$temporary_file"); then
+    rm -f "$temporary_file"
+    die "could not calculate the release checksum"
+  fi
+  rm -f "$temporary_file"
+  old_checksum=$(pinned_sha "$APP_NAME" "$version")
+
+  if [[ -z $old_checksum ]]; then
+    if [[ ! -f $CHECKSUMS ]]; then
+      printf '# Release checksums. Written by craft pin and checked by every build.\n# name          version     sha256\n' >"$CHECKSUMS"
+    fi
+    printf '%-15s %-11s %s\n' "$APP_NAME" "$version" "$checksum" >>"$CHECKSUMS"
+    echo "Pinned checksum: $checksum"
+  elif [[ $old_checksum == "$checksum" ]]; then
+    echo "Checksum already pinned and matches: $checksum"
+  else
+    die "$APP_NAME $version changed upstream after it was pinned.
+  Pinned:     $old_checksum
+  Downloaded: $checksum
+If you have reviewed and trust the new file, delete its line from checksums.conf and pin again."
+  fi
+}
+
+# Environment files contain KEY=VALUE settings; they are read, never executed.
+declare -A CONFIG
+
+parse_conf() {
+  local config_file=$1 line key value
+  local double_quotes='^"(.*)"$' single_quotes="^'(.*)'$"
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    if [[ $line =~ ^[[:space:]]*(#|$) ]]; then
+      continue
+    fi
+    if [[ ! $line =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
+      die "$config_file: expected KEY=VALUE, got: $line"
+    fi
+    key=${BASH_REMATCH[1]}
+    value=$(sed -E 's/(^|[[:space:]]+)#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' <<<"${BASH_REMATCH[2]}")
+    if [[ $value =~ $double_quotes || $value =~ $single_quotes ]]; then
+      value=${BASH_REMATCH[1]}
+    fi
+    CONFIG[$key]=$value
+  done <"$config_file"
+}
+
+json_str() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '"%s"' "$value"
+}
+
+setting_key() {
+  local key="${1^^}_$2"
+  echo "${key//-/_}"
+}
+
+# Accept either LIGHT_VERSION or LIGHTCRAFT_VERSION, but not both.
+app_setting_key() {
+  local slug=$1 name=$2 suffix=$3 config_file=$4
+  local slug_key name_key
+  slug_key=$(setting_key "$slug" "$suffix")
+  name_key=$(setting_key "$name" "$suffix")
+
+  if [[ $slug_key != "$name_key" && -n ${CONFIG[$slug_key]+x} && -n ${CONFIG[$name_key]+x} ]]; then
+    die "$config_file: both $slug_key and $name_key are set; keep one"
+  fi
+  if [[ -z ${CONFIG[$slug_key]+x} && -n ${CONFIG[$name_key]+x} ]]; then
+    echo "$name_key"
+  else
+    echo "$slug_key"
+  fi
+}
+
+# These settings are local to cmd_compose; Bash makes them available here.
+write_router_labels() {
+  local router_name=$1 rule=$2 extra_middlewares=$3
+  local router_middlewares=$middlewares
+
+  if [[ -n $extra_middlewares ]]; then
+    if [[ -n $router_middlewares ]]; then
+      router_middlewares+=",$extra_middlewares"
+    else
+      router_middlewares=$extra_middlewares
+    fi
+  fi
+
+  cat <<EOF
+      - "traefik.enable=true"
+      - "traefik.docker.network=$network"
+      - "traefik.http.routers.$router_name.rule=$rule"
+      - "traefik.http.routers.$router_name.entrypoints=$entrypoint"
+      - "traefik.http.routers.$router_name.tls=true"
+EOF
+  if [[ -n $certresolver ]]; then
+    echo "      - \"traefik.http.routers.$router_name.tls.certresolver=$certresolver\""
+  fi
+  if [[ -n $router_middlewares ]]; then
+    echo "      - \"traefik.http.routers.$router_name.middlewares=$router_middlewares\""
+  fi
+  cat <<EOF
+      - "traefik.http.routers.$router_name.service=$router_name"
+      - "traefik.http.services.$router_name.loadbalancer.server.port=8080"
+EOF
+}
+
+cmd_compose() {
+  [[ $# -ge 1 ]] || usage
+  local config_file=$1 output_dir=""
+  shift
+
+  [[ -f $config_file ]] || die "no such file: $config_file"
+  if [[ $config_file -ef $CATALOG ]]; then
+    die "$config_file is the app catalog; use an environment file such as $ROOT/environments/example.conf"
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--out)
+        [[ $# -ge 2 && -n $2 ]] || die "$1 requires a directory"
+        output_dir=$2
+        shift
+        ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  if [[ -z $output_dir ]]; then
+    output_dir=${config_file%.conf}
+  fi
+
+  parse_conf "$config_file"
+  local domain=${CONFIG[DOMAIN]:-}
+  local registry=${CONFIG[REGISTRY]:-$REGISTRY}
+  local project=${CONFIG[PROJECT]:-craft}
+  local network=${CONFIG[NETWORK]:-proxy}
+  local entrypoint=${CONFIG[ENTRYPOINT]:-websecure}
+  local certresolver=${CONFIG[CERTRESOLVER]:-}
+  local middlewares=${CONFIG[MIDDLEWARES]:-}
+  local title=${CONFIG[TITLE]:-Craft}
+  local default_version=${CONFIG[DEFAULT_VERSION]:-latest}
+  registry=${registry%/}
+  local dashboard_image=${CONFIG[DASHBOARD_IMAGE]:-${registry:+$registry/}craft-dashboard:latest}
+
+  [[ -n $domain ]] || die "$config_file: DOMAIN is required"
+  if [[ ! $project =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    die "$config_file: PROJECT must use lowercase letters, digits, - or _"
+  fi
+
+  local requested_apps=${CONFIG[APPS]:-}
+  requested_apps=${requested_apps//,/ }
+  local selection=" $requested_apps "
+  local name slug app_title repository asset key
+  local version_key digest_key version digest
+  local -a names=() slugs=() titles=() versions=() digests=()
+  local -A known_settings=(
+    [DOMAIN]=1 [REGISTRY]=1 [APPS]=1 [DEFAULT_VERSION]=1 [TITLE]=1 [PROJECT]=1
+    [NETWORK]=1 [ENTRYPOINT]=1 [CERTRESOLVER]=1 [MIDDLEWARES]=1 [DASHBOARD_IMAGE]=1
+  )
+
+  for slug in $requested_apps; do
+    if [[ $slug != all ]]; then
+      find_app "$slug" || die "$config_file: unknown app '$slug' in APPS; see apps.conf"
+    fi
+  done
+
+  # Keep apps in catalog order, regardless of the order in APPS.
+  while read -r name slug app_title repository asset; do
+    version_key=$(app_setting_key "$slug" "$name" VERSION "$config_file")
+    digest_key=$(app_setting_key "$slug" "$name" DIGEST "$config_file")
+    for key in "$slug" "$name"; do
+      known_settings[$(setting_key "$key" VERSION)]=1
+      known_settings[$(setting_key "$key" DIGEST)]=1
+    done
+
+    if [[ $selection != *" all "* && $selection != *" $slug "* && $selection != *" $name "* ]]; then
+      continue
+    fi
+
+    version=${CONFIG[$version_key]:-$default_version}
+    version=${version#v}
+    if [[ $version != latest ]]; then
+      if ! (check_version "$version") 2>/dev/null; then
+        die "$config_file: $version_key=$version must be 'latest' or a release version such as 0.7.0"
+      fi
+    fi
+    digest=${CONFIG[$digest_key]:-}
+    if [[ -n $digest ]]; then
+      if [[ $digest != sha256:* ]]; then
+        digest="sha256:$digest"
+      fi
+      if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        die "$config_file: $digest_key must be an image digest with 64 lowercase hexadecimal characters"
+      fi
+    fi
+
+    names+=("$name")
+    slugs+=("$slug")
+    titles+=("$app_title")
+    versions+=("$version")
+    digests+=("$digest")
+  done < <(catalog)
+
+  for key in "${!CONFIG[@]}"; do
+    if [[ -z ${known_settings[$key]:-} ]]; then
+      warn "$config_file: unknown setting $key (ignored)"
+    fi
+  done
+  if (( ${#slugs[@]} == 0 )); then
+    warn "$config_file: APPS is empty; only the dashboard will be deployed"
+  fi
+
+  local json index
+  json="{\"title\":$(json_str "$title"),\"apps\":["
+  for index in "${!slugs[@]}"; do
+    if (( index > 0 )); then
+      json+=","
+    fi
+    json+="{\"slug\":$(json_str "${slugs[index]}"),\"name\":$(json_str "${names[index]}"),\"title\":$(json_str "${titles[index]}"),\"version\":$(json_str "${versions[index]}")}"
+  done
+  json+="]}"
+  # Escape single quotes for YAML and dollar signs for Compose.
+  json=${json//\'/\'\'}
+  json=${json//\$/\$\$}
+
+  mkdir -p "$output_dir"
+  local file="$output_dir/docker-compose.yml" router_name
+  {
+    cat <<EOF
+# Generated by \`craft compose $(basename "$config_file")\`. Edit the .conf file and regenerate.
+# Apps: ${slugs[*]:-(none)}
+# Health checks are provided by the images.
+
+name: $project
+
+x-craft: &craft
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - $network
+
+services:
+  dashboard:
+    <<: *craft
+    image: $dashboard_image
+    environment:
+      CRAFT_CONFIG: '$json'
+    labels:
+EOF
+    write_router_labels "$project" "Host(\`$domain\`)" ""
+    for index in "${!slugs[@]}"; do
+      slug=${slugs[index]}
+      router_name="$project-$slug"
+      cat <<EOF
+
+  ${names[index]}:
+    <<: *craft
+    image: ${registry:+$registry/}${names[index]}:${versions[index]}${digests[index]:+@${digests[index]}}
+    labels:
+EOF
+      write_router_labels "$router_name" "Host(\`$domain\`) && (Path(\`/$slug\`) || PathPrefix(\`/$slug/\`))" "$router_name-slash,$router_name-strip"
+      cat <<EOF
+      - "traefik.http.middlewares.$router_name-slash.redirectregex.regex=^(https?://[^/]+/$slug)\$\$"
+      - "traefik.http.middlewares.$router_name-slash.redirectregex.replacement=\$\${1}/"
+      - "traefik.http.middlewares.$router_name-slash.redirectregex.permanent=true"
+      - "traefik.http.middlewares.$router_name-strip.stripprefix.prefixes=/$slug"
+EOF
+    done
+    cat <<EOF
+
+networks:
+  $network:
+    external: true
+EOF
+  } >"$file"
+
+  echo "Wrote $file (${#slugs[@]} app(s): ${slugs[*]:-none})"
+  echo "Deploy with: docker compose -f $file up -d --remove-orphans"
+}
+
+main() {
+  [[ $# -ge 1 ]] || usage
+  local command=$1
+  shift
+  case "$command" in
+    list)      cmd_list "$@" ;;
+    build)     cmd_build "$@" ;;
+    update)    cmd_update "$@" ;;
+    pin)       cmd_pin "$@" ;;
+    dashboard) cmd_dashboard "$@" ;;
+    compose)   cmd_compose "$@" ;;
+    -h|--help|help) usage 0 ;;
+    *) die "unknown command '$command' (try craft --help)" ;;
+  esac
+}
+
+# Keep these together so an edit during a long build cannot change the final exit command.
+main "$@"; exit
